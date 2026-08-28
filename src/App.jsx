@@ -14,10 +14,10 @@ import PlayerApp from './player/PlayerApp.jsx'
  * Supabase isn't configured — see App() below — so local/demo use never needs a login at all.
  */
 function AdminGate() {
-  const { session, profile, loading, sendMagicLink, signOut } = useAdminSession()
+  const { session, profile, loading, signIn, signOut } = useAdminSession()
 
   if (!session) {
-    return <AdminLogin sendMagicLink={sendMagicLink} />
+    return <AdminLogin signIn={signIn} />
   }
 
   if (loading) {

@@ -12,3 +12,6 @@ npm-debug.log*
 # here to avoid duplicating the whole source tree in git history.
 Performance-Hub-Project-Files/
 Performance-Hub-Project-Files.zip
+
+# Supabase CLI local cache/state (project ref, connection info) — regenerated per machine.
+supabase/.temp/

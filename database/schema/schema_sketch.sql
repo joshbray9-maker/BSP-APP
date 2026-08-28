@@ -120,6 +120,10 @@ create table profiles (
 
 -- SECURITY DEFINER so policies on `athletes`/`test_sessions`/etc. can check the caller's role
 -- without those policies themselves needing SELECT access to `profiles` (which would recurse).
+-- The `private` schema isn't created by default on a fresh Supabase project, so it has to be
+-- created here before the function that lives in it.
+create schema if not exists private;
+
 create or replace function private.current_profile()
 returns table (role text, athlete_id bigint)
 language sql security definer stable
@@ -135,11 +139,9 @@ alter table test_results enable row level security;
 alter table profiles enable row level security;
 alter table uploaded_files enable row level security;
 alter table readiness_config enable row level security;
--- vald_sync_log is normally written only by the Edge Function (service-role key, bypasses RLS
--- automatically) — but ManageTeamsPanel's "Sync Now" status poll reads it directly from the
--- browser with the anon key, so it needs its own admin-read policy too, added here for the same
--- 2026-08-26 migration that added real admin auth to check against.
-alter table vald_sync_log enable row level security;
+-- vald_sync_log's RLS is enabled further down, right after that table is actually created —
+-- it's defined later in this file (VALD API SYNC section), so enabling RLS on it here would
+-- fail with "relation does not exist" on a fresh database.
 
 -- Admin: full access everywhere. Josh is the only admin today (see original note below) — this
 -- is intentionally broad rather than per-table-scoped, since there's exactly one admin account.
@@ -156,8 +158,6 @@ create policy "admin full access: test_results" on test_results for all
 create policy "admin full access: uploaded_files" on uploaded_files for all
   using (exists (select 1 from private.current_profile() p where p.role = 'admin'));
 create policy "admin full access: readiness_config" on readiness_config for all
-  using (exists (select 1 from private.current_profile() p where p.role = 'admin'));
-create policy "admin read: vald_sync_log" on vald_sync_log for select
   using (exists (select 1 from private.current_profile() p where p.role = 'admin'));
 
 -- Player: read-only, own athlete row only. No insert/update/delete policies exist for players
@@ -251,3 +251,11 @@ create table vald_sync_log (
   started_at timestamptz not null default now(),
   finished_at timestamptz
 );
+
+-- vald_sync_log is normally written only by the Edge Function (service-role key, bypasses RLS
+-- automatically) — but ManageTeamsPanel's "Sync Now" status poll reads it directly from the
+-- browser with the anon key, so it needs its own admin-read policy too, added here for the same
+-- 2026-08-26 migration that added real admin auth to check against.
+alter table vald_sync_log enable row level security;
+create policy "admin read: vald_sync_log" on vald_sync_log for select
+  using (exists (select 1 from private.current_profile() p where p.role = 'admin'));

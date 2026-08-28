@@ -1,11 +1,9 @@
 /**
- * Admin/coach session hook — magic-link auth via Supabase, added 2026-08-26 alongside the
- * localStorage -> Supabase data migration (see store.js). Mirrors playerAuth.js's
- * usePlayerSession() exactly; kept as a separate hook (not a shared generic one) since the two
- * roles' `profiles` lookups and gating rules are different enough that sharing code would mean
- * branching inside one hook instead of two small clear ones. The RLS "admin full access" policies
- * in database/schema/schema_sketch.sql are what actually enforce anything — this hook only
- * surfaces session/profile state to the UI, it is not itself a security boundary.
+ * Admin/coach session hook — email+password auth via Supabase. Replaced magic-link auth
+ * 2026-08-27 per Josh's request (simpler to test with, no email rate-limit dependency). The RLS
+ * "admin full access" policies in database/schema/schema_sketch.sql are what actually enforce
+ * anything — this hook only surfaces session/profile state to the UI, it is not itself a
+ * security boundary.
  */
 import { useEffect, useState } from 'react'
 import { supabase, isSupabaseConfigured } from './supabaseClient.js'
@@ -42,9 +40,10 @@ export function useAdminSession() {
       })
   }, [session])
 
-  async function sendMagicLink(email) {
+  async function signIn(email, password) {
     if (!isSupabaseConfigured) throw new Error('Supabase is not configured yet.')
-    return supabase.auth.signInWithOtp({ email })
+    const { error } = await supabase.auth.signInWithPassword({ email, password })
+    if (error) throw error
   }
 
   async function signOut() {
@@ -52,5 +51,5 @@ export function useAdminSession() {
     await supabase.auth.signOut()
   }
 
-  return { session, profile, loading, sendMagicLink, signOut }
+  return { session, profile, loading, signIn, signOut }
 }
