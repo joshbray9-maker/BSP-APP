@@ -35,8 +35,11 @@ export default function AppShell({ onSignOut }) {
   const [role, setRole] = useState(ROLES.ADMIN)
   const [showAddOrg, setShowAddOrg] = useState(false)
 
+  // Compared as strings throughout this component: Supabase's bigint ids come through as JS
+  // numbers, but a <select>'s onChange always hands back a string — a strict === would silently
+  // fail to match any org/team picked from a dropdown except whichever loaded as the default.
   const orgTeams = useMemo(
-    () => store.teams.filter((t) => t.orgId === orgId),
+    () => store.teams.filter((t) => String(t.orgId) === String(orgId)),
     [store.teams, orgId],
   )
 
@@ -51,16 +54,19 @@ export default function AppShell({ onSignOut }) {
   // Keep teamId valid whenever the selected org changes (or its team list changes) — default
   // to that org's first team rather than leaving the team dropdown empty.
   useEffect(() => {
-    if (!orgTeams.some((t) => t.id === teamId)) {
+    if (!orgTeams.some((t) => String(t.id) === String(teamId))) {
       setTeamId(orgTeams[0]?.id ?? null)
       setSelectedAthlete(null)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [orgId, orgTeams])
 
-  const team = useMemo(() => store.teams.find((t) => t.id === teamId) ?? null, [store.teams, teamId])
+  const team = useMemo(
+    () => store.teams.find((t) => String(t.id) === String(teamId)) ?? null,
+    [store.teams, teamId],
+  )
   const org = useMemo(
-    () => store.organizations.find((o) => o.id === orgId) ?? null,
+    () => store.organizations.find((o) => String(o.id) === String(orgId)) ?? null,
     [store.organizations, orgId],
   )
 
