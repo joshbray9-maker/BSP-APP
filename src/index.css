@@ -1,0 +1,28 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+}
+
+:root {
+  /* Preliminary UI accent — not Josh's brand colors yet. Deliberately not orange so this reads
+     as a distinct product from the reference build. Overridden per-team/org at runtime by
+     src/lib/theme.js once a team/org color palette is set. */
+  --accent: #14b8a6;
+  --accent-fg: #04120f;
+  --accent-soft: #14b8a622;
+
+  /* Original static dark-theme background shades — used only until the first team/org selection
+     applies its own hue-tinted versions (see src/lib/theme.js applyBrandTheme). */
+  --bg: #0a0c10;
+  --surface: #111318;
+  --surface2: #1a1d26;
+  --border: #252836;
+}
+
+body {
+  @apply bg-bg text-text;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+}

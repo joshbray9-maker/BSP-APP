@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-ssr/
+.env
+.env.local
+.env.*.local
+.DS_Store
+*.log
+npm-debug.log*
+
+# Backup/mirror of this project, not the live app — kept alongside for reference, not tracked
+# here to avoid duplicating the whole source tree in git history.
+Performance-Hub-Project-Files/
+Performance-Hub-Project-Files.zip

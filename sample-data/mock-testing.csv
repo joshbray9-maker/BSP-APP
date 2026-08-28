@@ -1,0 +1,9 @@
+athlete_name,date,metric_key,value
+Athlete A01,2026-08-04,jump_height_in,24.1
+Athlete A01,2026-08-04,rsi_modified,0.41
+Athlete A01,2026-08-11,jump_height_in,25.0
+Athlete A01,2026-08-11,rsi_modified,0.44
+Athlete A02,2026-08-04,jump_height_in,21.7
+Athlete A02,2026-08-04,rsi_modified,0.36
+Athlete A02,2026-08-11,jump_height_in,20.9
+Athlete A02,2026-08-11,rsi_modified,0.33
