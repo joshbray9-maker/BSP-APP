@@ -252,12 +252,17 @@ function LocalStoreProvider({ children }) {
 // (Postgres) conversion happens, so components never need to know the DB's column names.
 // =================================================================================================
 
-const mapOrg = (r) => ({
+// valdSlugById maps organizations.vald_account_id (a bigint FK) to vald_accounts.slug (the string
+// key ManageTeamsPanel/the Edge Function actually key off of, e.g. 'personal' | 'universel') —
+// without this, org.valdAccount was always undefined and the "Sync Now" button stayed disabled
+// even when the org was correctly linked in the database.
+const mapOrg = (r, valdSlugById = new Map()) => ({
   id: r.id,
   name: r.name,
   logoUrl: r.logo_url,
   colorPrimary: r.color_primary,
   colorAccent: r.color_accent,
+  valdAccount: valdSlugById.get(r.vald_account_id) ?? null,
 })
 const mapTeam = (r) => ({
   id: r.id,
@@ -284,7 +289,7 @@ const EMPTY_DATA = {
 }
 
 async function fetchAllData() {
-  const [orgs, teams, athletes, sessions, results, uploads, readiness] = await Promise.all([
+  const [orgs, teams, athletes, sessions, results, uploads, readiness, valdAccounts] = await Promise.all([
     supabase.from('organizations').select('*'),
     supabase.from('teams').select('*'),
     supabase.from('athletes').select('*').eq('active', true),
@@ -292,14 +297,17 @@ async function fetchAllData() {
     supabase.from('test_results').select('*'),
     supabase.from('uploaded_files').select('*'),
     supabase.from('readiness_config').select('*').eq('id', 1).maybeSingle(),
+    supabase.from('vald_accounts').select('id, slug'),
   ])
 
-  for (const res of [orgs, teams, athletes, sessions, results, uploads, readiness]) {
+  for (const res of [orgs, teams, athletes, sessions, results, uploads, readiness, valdAccounts]) {
     if (res.error) throw new Error(res.error.message)
   }
 
+  const valdSlugById = new Map((valdAccounts.data ?? []).map((v) => [v.id, v.slug]))
+
   return {
-    organizations: (orgs.data ?? []).map(mapOrg),
+    organizations: (orgs.data ?? []).map((r) => mapOrg(r, valdSlugById)),
     teams: (teams.data ?? []).map(mapTeam),
     athletes: (athletes.data ?? []).map(mapAthlete),
     sessions: (sessions.data ?? []).map(mapSession),

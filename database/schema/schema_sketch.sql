@@ -238,6 +238,23 @@ create table vald_sync_state (
   primary key (vald_account_id, resource)
 );
 
+-- These three were left without RLS when first written (caught 2026-08-27 while wiring up the
+-- real integration) — tenant_id counts as private per the brief's own security note, and an
+-- unprotected vald_profile_map/vald_sync_state would let anyone with just the public anon key
+-- read or tamper with athlete<->VALD mappings and sync cursors. Admin-only, same pattern as
+-- every other admin-managed table above. `vald_accounts` also needs admin *read* for the
+-- ManageTeamsPanel "Sync Now" button, which looks up an org's account slug client-side.
+alter table vald_accounts enable row level security;
+alter table vald_profile_map enable row level security;
+alter table vald_sync_state enable row level security;
+
+create policy "admin full access: vald_accounts" on vald_accounts for all
+  using (exists (select 1 from private.current_profile() p where p.role = 'admin'));
+create policy "admin full access: vald_profile_map" on vald_profile_map for all
+  using (exists (select 1 from private.current_profile() p where p.role = 'admin'));
+create policy "admin full access: vald_sync_state" on vald_sync_state for all
+  using (exists (select 1 from private.current_profile() p where p.role = 'admin'));
+
 -- One row per sync run (manual button click or scheduled), for the client-side status poll
 -- (brief Section 13) and so unmatched/ambiguous athlete names and fetch failures are visible
 -- somewhere instead of silent (brief Sections 10 & 11).
