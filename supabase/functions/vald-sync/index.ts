@@ -37,7 +37,10 @@ const supabase = createClient(
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, content-type, x-trigger-type, x-cron-secret, x-vald-account',
+  // apikey and x-client-info are added automatically by supabase-js's functions.invoke() — missing
+  // either here fails the browser's CORS preflight silently (no server-side trace at all), which
+  // is exactly the failure mode Colin's brief warns about for this endpoint.
+  'Access-Control-Allow-Headers': 'authorization, apikey, x-client-info, content-type, x-trigger-type, x-cron-secret, x-vald-account',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 const jsonHeaders = { ...corsHeaders, 'Content-Type': 'application/json' }
