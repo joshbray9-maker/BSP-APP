@@ -339,14 +339,19 @@ async function createAthletesFromGroups(
   const alreadyMapped = new Set((mapRows ?? []).map((r) => r.profile_id))
   const activeNames = new Set(athletes.map((a) => norm(a.display_name)))
 
-  // profileId -> { team, name }; first mapped team wins if a profile sits in two mapped groups.
-  const candidates = new Map<string, { teamId: number; name: string }>()
+  // profileId -> every mapped team whose group contains them. Two groups feeding the SAME team
+  // (e.g. near-duplicate "BU MEN'S Rugby"/"BU MEN'S RUGBY") is fine; groups feeding DIFFERENT teams
+  // is a real conflict (a player can't be on both rosters from one sync) and is reported, not
+  // guessed — picking by query order would be arbitrary.
+  const candidates = new Map<string, { teamIds: Set<number>; name: string }>()
   for (const m of mappings as any[]) {
     for (const g of groups.filter((g) => norm(g.name) === norm(m.group_name))) {
       for (const p of await fetchProfilesInGroup(token, account.region!, account.tenant_id!, g.id)) {
         const name = `${p.givenName} ${p.familyName}`.trim()
-        if (!name || candidates.has(p.profileId)) continue
-        candidates.set(p.profileId, { teamId: m.team_id, name })
+        if (!name) continue
+        const existing = candidates.get(p.profileId)
+        if (existing) existing.teamIds.add(m.team_id)
+        else candidates.set(p.profileId, { teamIds: new Set([m.team_id]), name })
       }
     }
   }
@@ -356,17 +361,22 @@ async function createAthletesFromGroups(
 
   const toCreate: { team_id: number; display_name: string }[] = []
   let duplicateNames = 0
+  let teamConflicts = 0
   for (const [profileId, c] of candidates) {
     if (alreadyMapped.has(profileId) || activeNames.has(norm(c.name))) continue
+    if (c.teamIds.size > 1) {
+      teamConflicts++
+      continue
+    }
     if ((nameCounts.get(norm(c.name)) ?? 0) > 1) {
       duplicateNames++
       continue
     }
-    toCreate.push({ team_id: c.teamId, display_name: c.name })
+    toCreate.push({ team_id: [...c.teamIds][0], display_name: c.name })
   }
 
   if (toCreate.length > MAX_AUTO_CREATE) {
-    return { created: [] as { id: number; display_name: string }[], blocked: toCreate.length, duplicateNames }
+    return { created: [] as { id: number; display_name: string }[], blocked: toCreate.length, duplicateNames, teamConflicts }
   }
 
   const created: { id: number; display_name: string }[] = []
@@ -378,7 +388,7 @@ async function createAthletesFromGroups(
     if (error) throw new Error(`creating athletes failed: ${error.message}`)
     created.push(...(data ?? []))
   }
-  return { created, blocked: 0, duplicateNames }
+  return { created, blocked: 0, duplicateNames, teamConflicts }
 }
 
 async function syncAccount(account: ValdAccount, logId: number, orgId: string | null = null) {
@@ -535,6 +545,7 @@ async function syncAccount(account: ValdAccount, logId: number, orgId: string | 
           ? `SAFETY STOP: group mapping would add ${creation.blocked} athletes (limit ${MAX_AUTO_CREATE}) — none added, check vald_team_groups`
           : null,
         creation?.duplicateNames ? `${creation.duplicateNames} VALD profile(s) not added (duplicate full name — add manually)` : null,
+        creation?.teamConflicts ? `${creation.teamConflicts} VALD profile(s) not added (in groups mapped to different teams — add manually)` : null,
         `${syncedTests} test(s) synced for ${inScopeAthleteIds.size} roster athlete(s) (${tests.length} scanned in VALD, ${orgId ? `org ${orgId} only` : 'ALL orgs on this account'}, from ${since.slice(0, 10)})`,
         fetchFailures ? `${fetchFailures} trial fetch failure(s) — re-sync to retry` : null,
         // Count only — never list names. These are real people on VALD who simply aren't on this
