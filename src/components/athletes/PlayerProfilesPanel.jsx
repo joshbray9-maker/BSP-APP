@@ -19,7 +19,9 @@ export default function PlayerProfilesPanel({ team, org }) {
   const store = useStore()
   const athletes = getTeamAthletes(store, team.id)
   const [athleteId, setAthleteId] = useState(athletes[0]?.id ?? null)
-  const athlete = athletes.find((a) => a.id === athleteId) ?? athletes[0] ?? null
+  // Compared as strings: a <select> hands back its value as a string, but Supabase ids are numbers,
+  // so a strict === never matched and picking any player silently fell back to the first one.
+  const athlete = athletes.find((a) => String(a.id) === String(athleteId)) ?? athletes[0] ?? null
   const [exportingPdf, setExportingPdf] = useState(false)
   const [exportingPptx, setExportingPptx] = useState(false)
 

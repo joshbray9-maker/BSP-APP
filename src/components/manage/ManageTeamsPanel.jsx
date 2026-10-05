@@ -258,7 +258,7 @@ function RosterList({ roster, currentTeamId, store }) {
 
   function handleMove(athleteId) {
     const toTeamId = moveTargets[athleteId]
-    if (!toTeamId || toTeamId === currentTeamId) return
+    if (!toTeamId || String(toTeamId) === String(currentTeamId)) return
     store.moveAthlete({ athleteId, toTeamId })
   }
 
@@ -287,7 +287,7 @@ function RosterList({ roster, currentTeamId, store }) {
               </select>
               <button
                 onClick={() => handleMove(athlete.id)}
-                disabled={(moveTargets[athlete.id] ?? currentTeamId) === currentTeamId}
+                disabled={String(moveTargets[athlete.id] ?? currentTeamId) === String(currentTeamId)}
                 className="text-xs border border-border text-text px-2.5 py-1 rounded-md hover:border-accent disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 Move
