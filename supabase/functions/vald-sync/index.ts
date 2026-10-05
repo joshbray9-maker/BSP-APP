@@ -40,7 +40,7 @@ const corsHeaders = {
   // apikey and x-client-info are added automatically by supabase-js's functions.invoke() — missing
   // either here fails the browser's CORS preflight silently (no server-side trace at all), which
   // is exactly the failure mode Colin's brief warns about for this endpoint.
-  'Access-Control-Allow-Headers': 'authorization, apikey, x-client-info, content-type, x-trigger-type, x-cron-secret, x-vald-account',
+  'Access-Control-Allow-Headers': 'authorization, apikey, x-client-info, content-type, x-trigger-type, x-cron-secret, x-vald-account, x-vald-org',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 const jsonHeaders = { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -152,15 +152,41 @@ async function fetchTrialsForTest(token: string, region: string, tenantId: strin
 //    never copied from that prior project.
 // ---------------------------------------------------------------------------------------------
 
+// Filled in 2026-10-04 from real captured trials (de-identified inspection of 60 days of both
+// VALD accounts: CMJ, ABCMJ, SJ, IMTP; field names identical across accounts). Every scale/sign
+// correction in METRIC_TRANSFORMS below was verified against the data itself, not docs:
+//  - JUMP_HEIGHT is centimeters: matched JUMP_HEIGHT_INCHES x 2.54 in 32/32 trials.
+//  - RSI_MODIFIED comes back ~100x the conventional m/s scale: it equals JUMP_HEIGHT(cm) /
+//    contraction time(s), implied contraction times were 0.65-1.42 s across all trials. Dividing
+//    by 100 gives the conventional 0.15-0.61 range. (Re-derived here, not copied from any other
+//    project's correction.)
+//  - BRAKING_PHASE_DURATION is labeled "Millisecond" but is SECONDS: it equaled
+//    (BEGIN_CONCENTRIC_PHASE - BEGIN_BRAKING_PHASE) in 20/20 trials. Multiplied by 1000 to ms.
+//  - COUNTERMOVEMENT_DEPTH is reported as a negative displacement (down). Stored as a positive
+//    magnitude to match the dashboard's existing convention. SJ reports 0 for it, so not mapped.
+// Deliberately NOT mapped yet (genuinely ambiguous which VALD field Josh means — needs his call,
+// not a guess): time_to_peak_force_ms, ecc_braking_force_n, rel_propulsive_power_w_kg,
+// rel_peak_force_n_kg. QSB and DJ test types have no dashboard metric defined yet.
 const RESULT_TO_METRIC_KEY: Record<string, Record<string, string>> = {
-  // Example shape, once a real CMJ test payload has been inspected — our metric keys are in
-  // src/lib/metrics.js:
-  // CMJ: {
-  //   JUMP_HEIGHT: 'cmj_height_cm',
-  //   RSI_MODIFIED: 'rsi_modified',
-  //   COUNTERMOVEMENT_DEPTH: 'cm_depth_cm',
-  //   ECCENTRIC_BRAKING_FORCE: 'ecc_braking_force_n',
-  // },
+  CMJ: {
+    JUMP_HEIGHT: 'cmj_height_cm',
+    RSI_MODIFIED: 'rsi_modified',
+    COUNTERMOVEMENT_DEPTH: 'cm_depth_cm',
+    JUMP_HEIGHT_IMP_MOM: 'jump_height_im_cm',
+    MEAN_CONCENTRIC_POWER: 'concentric_mean_power_w',
+    BRAKING_PHASE_DURATION: 'braking_duration_ms',
+  },
+  ABCMJ: { JUMP_HEIGHT: 'abalakov_height_cm' },
+  SJ: { JUMP_HEIGHT: 'sj_height_cm' },
+  // Gross peak force (includes body weight); NET_PEAK_VERTICAL_FORCE is the body-weight-removed
+  // variant — gross is the common IMTP "peak force" convention, flagged for Josh to confirm.
+  IMTP: { PEAK_VERTICAL_FORCE: 'imtp_n' },
+}
+
+const METRIC_TRANSFORMS: Record<string, (v: number) => number> = {
+  rsi_modified: (v) => v / 100,
+  cm_depth_cm: (v) => Math.abs(v),
+  braking_duration_ms: (v) => v * 1000,
 }
 
 const TRIAL_LIMB = 'Trial'
@@ -184,7 +210,21 @@ function pickRepresentativeTrial(trials: any[]) {
       }
     }
   }
-  return anyJump ? best : trials[trials.length - 1]
+  if (anyJump) return best
+
+  // Isometric pulls (IMTP) report no JUMP_HEIGHT. Last-recorded-trial under-reports: in real
+  // samples the last rep was the strongest in only 2 of 4 tests. Take the highest peak force
+  // instead — the standard "best rep" convention. Anything else falls back to the last trial.
+  let bestForce = -Infinity
+  let bestForceTrial: any = null
+  for (const trial of trials) {
+    const v = extractTrialValue(trial.results ?? [], 'PEAK_VERTICAL_FORCE')
+    if (v != null && v > bestForce) {
+      bestForce = v
+      bestForceTrial = trial
+    }
+  }
+  return bestForceTrial ?? trials[trials.length - 1]
 }
 
 function mapTrialResults(testType: string, results: any[]) {
@@ -194,8 +234,10 @@ function mapTrialResults(testType: string, results: any[]) {
   for (const r of results ?? []) {
     const key = r.definition?.result
     if (!key || r.limb !== TRIAL_LIMB) continue
-    if (scoped[key]) mapped[scoped[key]] = r.value
-    else raw[key] = r.value
+    if (scoped[key]) {
+      const metricKey = scoped[key]
+      mapped[metricKey] = METRIC_TRANSFORMS[metricKey] ? METRIC_TRANSFORMS[metricKey](r.value) : r.value
+    } else raw[key] = r.value
   }
   return { mapped, raw }
 }
@@ -241,7 +283,7 @@ function matchProfilesToAthletes(
 // 7. Sync one VALD account — profiles/matching, incremental fetch, idempotent write
 // ---------------------------------------------------------------------------------------------
 
-async function syncAccount(account: ValdAccount, logId: number) {
+async function syncAccount(account: ValdAccount, logId: number, orgId: string | null = null) {
   const finalize = (status: string, message: string) =>
     supabase.from('vald_sync_log').update({ status, message, finished_at: new Date().toISOString() }).eq('id', logId)
 
@@ -252,12 +294,18 @@ async function syncAccount(account: ValdAccount, logId: number) {
     const { clientId, clientSecret } = credentialsFor(account)
     const token = await getToken(clientId, clientSecret)
 
-    // Scope matching to only athletes whose org maps to THIS account — orgs.vald_account_id.
-    const { data: athletes } = await supabase
+    // Scope matching to only athletes whose org maps to THIS account — orgs.vald_account_id. When
+    // `orgId` is set (the per-org "Sync Now" button), narrow further to just that one org's
+    // roster, so syncing BU never reads or writes another program's athletes even though they
+    // share the same VALD account.
+    let athletesQuery = supabase
       .from('athletes')
-      .select('id, display_name, teams!inner(organizations!inner(vald_account_id))')
+      .select('id, display_name, teams!inner(org_id, organizations!inner(vald_account_id))')
       .eq('active', true)
       .eq('teams.organizations.vald_account_id', account.id)
+    if (orgId) athletesQuery = athletesQuery.eq('teams.org_id', orgId)
+    const { data: athletes } = await athletesQuery
+    const inScopeAthleteIds = new Set((athletes ?? []).map((a: any) => a.id))
 
     const profiles = await fetchProfiles(token, account.region, account.tenant_id)
     const { matched, unmatched, ambiguous } = matchProfilesToAthletes(profiles, (athletes ?? []) as any)
@@ -268,11 +316,15 @@ async function syncAccount(account: ValdAccount, logId: number) {
         .upsert({ athlete_id: m.athleteId, vald_account_id: account.id, profile_id: m.profileId }, { onConflict: 'athlete_id' })
     }
 
+    // The incremental cursor is per-org when scoped: one shared per-account cursor would let
+    // syncing org A advance past tests that belong to org B's athletes, silently skipping B's
+    // history the first time it's synced. `resource` is free text, so no schema change needed.
+    const stateResource = orgId ? `forcedecks_tests:org:${orgId}` : 'forcedecks_tests'
     const { data: state } = await supabase
       .from('vald_sync_state')
       .select('last_modified_utc')
       .eq('vald_account_id', account.id)
-      .eq('resource', 'forcedecks_tests')
+      .eq('resource', stateResource)
       .maybeSingle()
     const since = state?.last_modified_utc ?? '2020-01-01T00:00:00.000Z'
 
@@ -281,10 +333,15 @@ async function syncAccount(account: ValdAccount, logId: number) {
       .from('vald_profile_map')
       .select('athlete_id, profile_id')
       .eq('vald_account_id', account.id)
-    const profileToAthlete = new Map((mapRows ?? []).map((r) => [r.profile_id, r.athlete_id]))
+    // Only athletes in scope — earlier syncs may have mapped other orgs' athletes under this
+    // same account, and those must not be touched by a single-org sync.
+    const profileToAthlete = new Map(
+      (mapRows ?? []).filter((r) => inScopeAthleteIds.has(r.athlete_id)).map((r) => [r.profile_id, r.athlete_id]),
+    )
 
     let newestModified = since
     let fetchFailures = 0
+    let syncedTests = 0
     const CONCURRENCY = 3
 
     for (let i = 0; i < tests.length; i += CONCURRENCY) {
@@ -315,6 +372,7 @@ async function syncAccount(account: ValdAccount, logId: number) {
       // legitimately map to the same athlete/date/type (e.g. a warm-up rep recorded separately).
       for (const row of rows) {
         if (!row) continue
+        syncedTests++
         const { data: session } = await supabase
           .from('test_sessions')
           .upsert(
@@ -338,14 +396,16 @@ async function syncAccount(account: ValdAccount, logId: number) {
 
     await supabase
       .from('vald_sync_state')
-      .upsert({ vald_account_id: account.id, resource: 'forcedecks_tests', last_modified_utc: newestModified, last_synced_at: new Date().toISOString() }, { onConflict: 'vald_account_id,resource' })
+      .upsert({ vald_account_id: account.id, resource: stateResource, last_modified_utc: newestModified, last_synced_at: new Date().toISOString() }, { onConflict: 'vald_account_id,resource' })
 
     await finalize(
       'complete',
       [
-        `${tests.length} test(s) processed`,
+        `${syncedTests} test(s) synced for ${inScopeAthleteIds.size} roster athlete(s) (${tests.length} scanned in VALD)`,
         fetchFailures ? `${fetchFailures} trial fetch failure(s) — re-sync to retry` : null,
-        unmatched.length ? `${unmatched.length} unmatched VALD profile(s): ${unmatched.map((u) => u.name).join(', ')}` : null,
+        // Count only — never list names. These are real people on VALD who simply aren't on this
+        // roster (expected to be most of the account), and don't belong in a log table.
+        unmatched.length ? `${unmatched.length} VALD profile(s) not on this roster` : null,
         ambiguous.length ? `${ambiguous.length} ambiguous (duplicate active name) profile(s) skipped: ${ambiguous.map((a) => a.name).join(', ')}` : null,
       ]
         .filter(Boolean)
@@ -416,6 +476,14 @@ Deno.serve(async (req) => {
   if (accountsError) return new Response(JSON.stringify({ error: accountsError.message }), { status: 500, headers: jsonHeaders })
   if (!accounts?.length) return new Response(JSON.stringify({ error: 'no matching vald_accounts row' }), { status: 404, headers: jsonHeaders })
 
+  // Optional org scope from the per-org "Sync Now" button. Must be a plain integer id — it's
+  // interpolated into a sync-state key and used in a query filter, so reject anything else.
+  const orgHeader = req.headers.get('x-vald-org')
+  if (orgHeader && !/^\d+$/.test(orgHeader)) {
+    return new Response(JSON.stringify({ error: 'Invalid x-vald-org' }), { status: 400, headers: jsonHeaders })
+  }
+  const orgId = orgHeader || null
+
   const logIds: number[] = []
   for (const account of accounts as ValdAccount[]) {
     const { data: logRow, error } = await supabase
@@ -426,7 +494,7 @@ Deno.serve(async (req) => {
     if (error || !logRow) continue
     logIds.push(logRow.id)
     // @ts-ignore — EdgeRuntime is a Supabase Edge Functions global.
-    EdgeRuntime.waitUntil(syncAccount(account, logRow.id))
+    EdgeRuntime.waitUntil(syncAccount(account, logRow.id, orgId))
   }
 
   return new Response(JSON.stringify({ ok: true, started: true, logIds }), { headers: jsonHeaders })

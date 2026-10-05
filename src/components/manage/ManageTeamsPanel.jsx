@@ -83,7 +83,9 @@ function VaidSyncSection({ org }) {
     setStatus('syncing')
     try {
       const { data, error } = await supabase.functions.invoke('vald-sync', {
-        headers: { 'x-vald-account': org.valdAccount },
+        // x-vald-org scopes the sync to just this organization's roster — several orgs share one
+        // VALD account, and clicking Sync Now on BU shouldn't touch BCS/Iona athletes.
+        headers: { 'x-vald-account': org.valdAccount, 'x-vald-org': String(org.id) },
       })
       if (error) throw error
       const logId = data?.logIds?.[0]

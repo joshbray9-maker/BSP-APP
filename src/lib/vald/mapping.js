@@ -54,9 +54,21 @@ export function pickRepresentativeTrial(trials) {
       }
     }
   }
-  // Non-jump tests (isometric pulls and similar) report no JUMP_HEIGHT at all — fall back to
-  // the last recorded trial for those.
-  return anyJump ? best : trials[trials.length - 1]
+  if (anyJump) return best
+
+  // Isometric pulls (IMTP) report no JUMP_HEIGHT. Last-recorded-trial under-reports (in real
+  // samples the last rep was the strongest in only 2 of 4 tests), so take the highest peak force
+  // — the standard "best rep" convention. Anything else falls back to the last trial.
+  let bestForce = -Infinity
+  let bestForceTrial = null
+  for (const trial of trials) {
+    const v = extractTrialValue(trial.results ?? [], 'PEAK_VERTICAL_FORCE')
+    if (v != null && v > bestForce) {
+      bestForce = v
+      bestForceTrial = trial
+    }
+  }
+  return bestForceTrial ?? trials[trials.length - 1]
 }
 
 /**
@@ -69,19 +81,23 @@ export function pickRepresentativeTrial(trials) {
  * @param {string} testType
  * @param {{definition?: {result?: string}, limb?: string, value?: number}[]} results
  * @param {Record<string, Record<string, string>>} resultToColumnByTestType - { [testType]: { [resultString]: yourColumnName } }
+ * @param {Record<string, (v: number) => number>} [transforms] - per-destination-column scale/sign
+ *   corrections (e.g. rsi_modified: v => v / 100), each verified against real captured data.
  * @returns {{ mapped: Record<string, number>, raw: Record<string, number> }} `mapped` = values
  *   that hit a known column for this test type; `raw` = every other Trial-limb value, kept
  *   (never dropped) for the raw_json catch-all column.
  */
-export function mapTrialResults(testType, results, resultToColumnByTestType) {
+export function mapTrialResults(testType, results, resultToColumnByTestType, transforms = {}) {
   const scoped = resultToColumnByTestType[testType] ?? {}
   const mapped = {}
   const raw = {}
   for (const r of results ?? []) {
     const key = r.definition?.result
     if (!key || r.limb !== TRIAL_LIMB) continue
-    if (scoped[key]) mapped[scoped[key]] = r.value
-    else raw[key] = r.value
+    if (scoped[key]) {
+      const col = scoped[key]
+      mapped[col] = transforms[col] ? transforms[col](r.value) : r.value
+    } else raw[key] = r.value
   }
   return { mapped, raw }
 }
