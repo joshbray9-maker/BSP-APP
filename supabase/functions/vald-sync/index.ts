@@ -452,6 +452,26 @@ async function syncAccount(account: ValdAccount, logId: number, orgId: string | 
     let syncedTests = 0
     const CONCURRENCY = 3
 
+    // Progress is saved as the sync runs, not just at the end: a first-time backfill can be
+    // hundreds of one-call-per-test trial fetches, and an Edge Function has a hard time limit. If
+    // it gets cut off, the next click resumes where this one stopped instead of starting over.
+    // Tests arrive ordered by modifiedDateUtc, so "everything up to this timestamp is done" is
+    // safe to record — EXCEPT it must never advance past a test whose trial fetch failed, or that
+    // test would be skipped forever (every write is an idempotent upsert, so re-doing the tail
+    // after a failure is harmless).
+    let firstFailureModified: string | null = null
+    const persistCursor = async (candidate: string) => {
+      let cursor = candidate
+      if (firstFailureModified) {
+        const justBefore = new Date(new Date(firstFailureModified).getTime() - 1).toISOString()
+        if (justBefore < cursor) cursor = justBefore
+      }
+      if (cursor <= since) return
+      await supabase
+        .from('vald_sync_state')
+        .upsert({ vald_account_id: account.id, resource: stateResource, last_modified_utc: cursor, last_synced_at: new Date().toISOString() }, { onConflict: 'vald_account_id,resource' })
+    }
+
     for (let i = 0; i < tests.length; i += CONCURRENCY) {
       const batch = tests.slice(i, i + CONCURRENCY)
       const rows = await Promise.all(
@@ -464,12 +484,12 @@ async function syncAccount(account: ValdAccount, logId: number, orgId: string | 
             trials = await fetchTrialsForTest(token, account.region!, account.tenant_id!, test.testId)
           } catch {
             fetchFailures++
+            if (!firstFailureModified || test.modifiedDateUtc < firstFailureModified) firstFailureModified = test.modifiedDateUtc
             return null // do not write a silently-null row — surfaced in the log message instead
           }
 
           const bestTrial = pickRepresentativeTrial(trials)
           const { mapped, raw } = mapTrialResults(test.testType, bestTrial?.results ?? [])
-          if (test.modifiedDateUtc > newestModified) newestModified = test.modifiedDateUtc
 
           return { athleteId, sessionDate: test.recordedDateUtc.slice(0, 10), testType: test.testType, mapped, raw, testId: test.testId, trialCount: trials.length }
         }),
@@ -500,11 +520,12 @@ async function syncAccount(account: ValdAccount, logId: number, orgId: string | 
             )
         }
       }
+
+      // Save progress every 5 batches (15 tests) so a cut-off run loses at most a few seconds.
+      if ((i / CONCURRENCY) % 5 === 4) await persistCursor(batch[batch.length - 1].modifiedDateUtc)
     }
 
-    await supabase
-      .from('vald_sync_state')
-      .upsert({ vald_account_id: account.id, resource: stateResource, last_modified_utc: newestModified, last_synced_at: new Date().toISOString() }, { onConflict: 'vald_account_id,resource' })
+    if (tests.length) await persistCursor(tests[tests.length - 1].modifiedDateUtc)
 
     await finalize(
       'complete',
@@ -514,7 +535,7 @@ async function syncAccount(account: ValdAccount, logId: number, orgId: string | 
           ? `SAFETY STOP: group mapping would add ${creation.blocked} athletes (limit ${MAX_AUTO_CREATE}) — none added, check vald_team_groups`
           : null,
         creation?.duplicateNames ? `${creation.duplicateNames} VALD profile(s) not added (duplicate full name — add manually)` : null,
-        `${syncedTests} test(s) synced for ${inScopeAthleteIds.size} roster athlete(s) (${tests.length} scanned in VALD)`,
+        `${syncedTests} test(s) synced for ${inScopeAthleteIds.size} roster athlete(s) (${tests.length} scanned in VALD, ${orgId ? `org ${orgId} only` : 'ALL orgs on this account'}, from ${since.slice(0, 10)})`,
         fetchFailures ? `${fetchFailures} trial fetch failure(s) — re-sync to retry` : null,
         // Count only — never list names. These are real people on VALD who simply aren't on this
         // roster (expected to be most of the account), and don't belong in a log table.

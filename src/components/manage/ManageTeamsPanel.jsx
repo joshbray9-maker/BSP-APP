@@ -97,7 +97,9 @@ function VaidSyncSection({ org }) {
   }
 
   async function pollSyncLog(logId) {
-    for (let i = 0; i < 30; i++) {
+    // Up to ~5 minutes: a first-time backfill is hundreds of one-per-test trial fetches. If it
+    // outlasts this, the status still says "Sync started." and the sync keeps running server-side.
+    for (let i = 0; i < 150; i++) {
       const { data: row } = await supabase.from('vald_sync_log').select('status, message').eq('id', logId).single()
       if (row && row.status !== 'processing') return row
       await new Promise((r) => setTimeout(r, 2000))
