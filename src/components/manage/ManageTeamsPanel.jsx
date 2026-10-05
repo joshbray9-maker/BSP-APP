@@ -75,6 +75,7 @@ export default function ManageTeamsPanel({ org, team }) {
  * program shares his personal one. Demo orgs (Team Alpha/Beta) have no VALD account at all.
  */
 function VaidSyncSection({ org }) {
+  const store = useStore()
   const [status, setStatus] = useState(null) // null | 'syncing' | {message, isError}
 
   const accountLabel = org.valdAccount ? VALD_ACCOUNT_LABELS[org.valdAccount] : null
@@ -90,6 +91,9 @@ function VaidSyncSection({ org }) {
       if (error) throw error
       const logId = data?.logIds?.[0]
       const result = logId ? await pollSyncLog(logId) : null
+      // The sync writes athletes/sessions/results server-side, which this page has no way to know
+      // about — re-read so the new data shows up without a manual page refresh.
+      await store.refresh()
       setStatus({ message: result?.message ?? 'Sync started.', isError: result?.status === 'error' })
     } catch (e) {
       setStatus({ message: e.message ?? 'Sync failed.', isError: true })

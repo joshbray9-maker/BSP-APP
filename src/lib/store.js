@@ -63,6 +63,8 @@ function LocalStoreProvider({ children }) {
       ...data,
       loading: false,
 
+      refresh() {}, // nothing external writes to the local store; present so callers needn't check
+
       resetToSeed() {
         setData(MOCK_SEED)
       },
@@ -288,14 +290,30 @@ const EMPTY_DATA = {
   readinessConfig: { selectedMetricKeys: [], thresholds: {} },
 }
 
+// Supabase/PostgREST silently caps any single select at 1,000 rows (no error, just truncated), so a
+// plain `.select('*')` on test_results would quietly show PARTIAL data the moment a roster's
+// history passes that — easy to hit once VALD sync backfills real history. Pages through
+// everything instead, ordered by id so pages don't overlap or skip. Returns the same
+// `{ data, error }` shape as a normal select so callers' error handling is unchanged.
+async function selectAll(table, refine = (q) => q) {
+  const PAGE = 1000
+  const rows = []
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await refine(supabase.from(table).select('*')).order('id').range(from, from + PAGE - 1)
+    if (error) return { data: null, error }
+    rows.push(...data)
+    if (data.length < PAGE) return { data: rows, error: null }
+  }
+}
+
 async function fetchAllData() {
   const [orgs, teams, athletes, sessions, results, uploads, readiness, valdAccounts] = await Promise.all([
-    supabase.from('organizations').select('*'),
-    supabase.from('teams').select('*'),
-    supabase.from('athletes').select('*').eq('active', true),
-    supabase.from('test_sessions').select('*'),
-    supabase.from('test_results').select('*'),
-    supabase.from('uploaded_files').select('*'),
+    selectAll('organizations'),
+    selectAll('teams'),
+    selectAll('athletes', (q) => q.eq('active', true)),
+    selectAll('test_sessions'),
+    selectAll('test_results'),
+    selectAll('uploaded_files'),
     supabase.from('readiness_config').select('*').eq('id', 1).maybeSingle(),
     supabase.from('vald_accounts').select('id, slug'),
   ])
@@ -344,6 +362,13 @@ function SupabaseStoreProvider({ children }) {
       ...data,
       loading,
       error,
+
+      // Re-reads everything from the database. Needed after anything that changes data OUTSIDE
+      // this provider's own mutators (e.g. the VALD sync Edge Function writing in the background) —
+      // otherwise the page keeps showing whatever it loaded at mount.
+      async refresh() {
+        await refetch()
+      },
 
       resetToSeed() {
         // Deliberately a no-op against a real database — nothing in the UI calls this today, and
