@@ -276,3 +276,18 @@ create table vald_sync_log (
 alter table vald_sync_log enable row level security;
 create policy "admin read: vald_sync_log" on vald_sync_log for select
   using (exists (select 1 from private.current_profile() p where p.role = 'admin'));
+
+-- Which VALD group(s) feed which dashboard team (added 2026-10-04). OPT-IN per team: the sync only
+-- auto-creates roster athletes for teams that have a row here, from the members of the named VALD
+-- group — never "every VALD profile on the account" (a personal VALD account holds hundreds of
+-- profiles spanning every program). Matched case-insensitively by group NAME rather than id, since
+-- real accounts have near-duplicate groups (e.g. "BU MEN'S Rugby" and "BU MEN'S RUGBY") that
+-- should both feed the same team. A team can list several groups.
+create table vald_team_groups (
+  team_id bigint not null references teams(id) on delete cascade,
+  group_name text not null,
+  primary key (team_id, group_name)
+);
+alter table vald_team_groups enable row level security;
+create policy "admin full access: vald_team_groups" on vald_team_groups for all
+  using (exists (select 1 from private.current_profile() p where p.role = 'admin'));

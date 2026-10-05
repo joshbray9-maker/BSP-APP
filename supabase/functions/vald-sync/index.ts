@@ -27,6 +27,11 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 const AUTH_URL = 'https://auth.prd.vald.com/oauth/token'
 const profilesBase = (region: string) => `https://prd-${region}-api-externalprofile.valdperformance.com`
 const forceDecksBase = (region: string) => `https://prd-${region}-api-extforcedecks.valdperformance.com`
+const tenantsBase = (region: string) => `https://prd-${region}-api-externaltenants.valdperformance.com`
+
+// Safety cap on auto-created athletes per sync. A VALD group mapped to the wrong team (or a huge
+// group like an academy-wide one) would otherwise flood a roster with hundreds of unrelated people.
+const MAX_AUTO_CREATE = 150
 
 const CRON_SECRET = Deno.env.get('VALD_SYNC_CRON_SECRET')!
 
@@ -87,6 +92,23 @@ const authHeaders = (t: string) => ({ Authorization: `Bearer ${t}` })
 async function fetchProfiles(token: string, region: string, tenantId: string) {
   const res = await fetch(`${profilesBase(region)}/profiles?tenantId=${tenantId}`, { headers: authHeaders(token) })
   if (!res.ok) throw new Error(`profiles fetch failed: ${res.status}`)
+  const data = await res.json()
+  return (data.profiles ?? data) as { profileId: string; givenName: string; familyName: string }[]
+}
+
+async function fetchGroups(token: string, region: string, tenantId: string) {
+  const res = await fetch(`${tenantsBase(region)}/groups?tenantId=${tenantId}`, { headers: authHeaders(token) })
+  if (!res.ok) throw new Error(`groups fetch failed: ${res.status}`)
+  const data = await res.json()
+  return (data.groups ?? data) as { id: string; name: string }[]
+}
+
+// The Profiles list carries NO group membership on each profile (verified against real data), but
+// it does honor a `groupId` query filter — so membership is read by asking per group.
+async function fetchProfilesInGroup(token: string, region: string, tenantId: string, groupId: string) {
+  const res = await fetch(`${profilesBase(region)}/profiles?tenantId=${tenantId}&groupId=${groupId}`, { headers: authHeaders(token) })
+  if (res.status === 204) return []
+  if (!res.ok) throw new Error(`group profiles fetch failed: ${res.status}`)
   const data = await res.json()
   return (data.profiles ?? data) as { profileId: string; givenName: string; familyName: string }[]
 }
@@ -283,6 +305,82 @@ function matchProfilesToAthletes(
 // 7. Sync one VALD account — profiles/matching, incremental fetch, idempotent write
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// 6b. Create roster athletes from VALD groups — OPT-IN PER TEAM via `vald_team_groups` (team_id +
+//     VALD group name). Teams with no mapping row never get auto-created athletes.
+//
+//     The brief's rule is "never insert on an uncertain match", so this only creates when the
+//     placement is unambiguous: the profile is in a group explicitly mapped to a team, isn't
+//     already linked to any athlete, doesn't share a name with an active athlete (that's a normal
+//     match, not a create), and its name is unique among the candidates (two VALD people with the
+//     same full name would create two identical roster entries that every later sync then skips
+//     as ambiguous forever — those are reported for a human instead). Only name and team are
+//     stored; VALD's dateOfBirth is deliberately never read into our database.
+// ---------------------------------------------------------------------------------------------
+
+async function createAthletesFromGroups(
+  account: ValdAccount,
+  token: string,
+  orgId: string | null,
+  athletes: { id: number; display_name: string }[],
+) {
+  let mappingQuery = supabase
+    .from('vald_team_groups')
+    .select('team_id, group_name, teams!inner(org_id, organizations!inner(vald_account_id))')
+    .eq('teams.organizations.vald_account_id', account.id)
+  if (orgId) mappingQuery = mappingQuery.eq('teams.org_id', orgId)
+  const { data: mappings } = await mappingQuery
+  if (!mappings?.length) return null // feature is off for everything in scope
+
+  const norm = (s: string) => s.trim().toLowerCase()
+  const groups = await fetchGroups(token, account.region!, account.tenant_id!)
+
+  const { data: mapRows } = await supabase.from('vald_profile_map').select('profile_id').eq('vald_account_id', account.id)
+  const alreadyMapped = new Set((mapRows ?? []).map((r) => r.profile_id))
+  const activeNames = new Set(athletes.map((a) => norm(a.display_name)))
+
+  // profileId -> { team, name }; first mapped team wins if a profile sits in two mapped groups.
+  const candidates = new Map<string, { teamId: number; name: string }>()
+  for (const m of mappings as any[]) {
+    for (const g of groups.filter((g) => norm(g.name) === norm(m.group_name))) {
+      for (const p of await fetchProfilesInGroup(token, account.region!, account.tenant_id!, g.id)) {
+        const name = `${p.givenName} ${p.familyName}`.trim()
+        if (!name || candidates.has(p.profileId)) continue
+        candidates.set(p.profileId, { teamId: m.team_id, name })
+      }
+    }
+  }
+
+  const nameCounts = new Map<string, number>()
+  for (const c of candidates.values()) nameCounts.set(norm(c.name), (nameCounts.get(norm(c.name)) ?? 0) + 1)
+
+  const toCreate: { team_id: number; display_name: string }[] = []
+  let duplicateNames = 0
+  for (const [profileId, c] of candidates) {
+    if (alreadyMapped.has(profileId) || activeNames.has(norm(c.name))) continue
+    if ((nameCounts.get(norm(c.name)) ?? 0) > 1) {
+      duplicateNames++
+      continue
+    }
+    toCreate.push({ team_id: c.teamId, display_name: c.name })
+  }
+
+  if (toCreate.length > MAX_AUTO_CREATE) {
+    return { created: [] as { id: number; display_name: string }[], blocked: toCreate.length, duplicateNames }
+  }
+
+  const created: { id: number; display_name: string }[] = []
+  for (let i = 0; i < toCreate.length; i += 100) {
+    const { data, error } = await supabase
+      .from('athletes')
+      .insert(toCreate.slice(i, i + 100).map((r) => ({ ...r, active: true })))
+      .select('id, display_name')
+    if (error) throw new Error(`creating athletes failed: ${error.message}`)
+    created.push(...(data ?? []))
+  }
+  return { created, blocked: 0, duplicateNames }
+}
+
 async function syncAccount(account: ValdAccount, logId: number, orgId: string | null = null) {
   const finalize = (status: string, message: string) =>
     supabase.from('vald_sync_log').update({ status, message, finished_at: new Date().toISOString() }).eq('id', logId)
@@ -308,7 +406,17 @@ async function syncAccount(account: ValdAccount, logId: number, orgId: string | 
     const inScopeAthleteIds = new Set((athletes ?? []).map((a: any) => a.id))
 
     const profiles = await fetchProfiles(token, account.region, account.tenant_id)
-    const { matched, unmatched, ambiguous } = matchProfilesToAthletes(profiles, (athletes ?? []) as any)
+
+    // Create roster entries for VALD-group members on teams opted in via vald_team_groups, BEFORE
+    // matching, so the new athletes match their own profiles and their tests sync in this same run.
+    const athleteList = [...(athletes ?? [])] as { id: number; display_name: string }[]
+    const creation = await createAthletesFromGroups(account, token, orgId, athleteList)
+    if (creation) {
+      athleteList.push(...creation.created)
+      creation.created.forEach((a) => inScopeAthleteIds.add(a.id))
+    }
+
+    const { matched, unmatched, ambiguous } = matchProfilesToAthletes(profiles, athleteList as any)
 
     for (const m of matched) {
       await supabase
@@ -401,6 +509,11 @@ async function syncAccount(account: ValdAccount, logId: number, orgId: string | 
     await finalize(
       'complete',
       [
+        creation?.created.length ? `${creation.created.length} athlete(s) added from VALD group(s)` : null,
+        creation?.blocked
+          ? `SAFETY STOP: group mapping would add ${creation.blocked} athletes (limit ${MAX_AUTO_CREATE}) — none added, check vald_team_groups`
+          : null,
+        creation?.duplicateNames ? `${creation.duplicateNames} VALD profile(s) not added (duplicate full name — add manually)` : null,
         `${syncedTests} test(s) synced for ${inScopeAthleteIds.size} roster athlete(s) (${tests.length} scanned in VALD)`,
         fetchFailures ? `${fetchFailures} trial fetch failure(s) — re-sync to retry` : null,
         // Count only — never list names. These are real people on VALD who simply aren't on this
