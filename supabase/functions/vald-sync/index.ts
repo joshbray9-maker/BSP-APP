@@ -428,6 +428,15 @@ async function syncAccount(account: ValdAccount, logId: number, orgId: string | 
 
     const { matched, unmatched, ambiguous } = matchProfilesToAthletes(profiles, athleteList as any)
 
+    // Athletes linked to a VALD profile for the FIRST time by this run (just created from a group,
+    // added by hand since the last sync, or renamed to match). Their history predates the saved
+    // cursor — a cursor that may have advanced while they weren't on any roster — so reading only
+    // "since the cursor" would skip it forever. Detected before the upserts below make them look
+    // already-linked.
+    const { data: priorMap } = await supabase.from('vald_profile_map').select('athlete_id').eq('vald_account_id', account.id)
+    const priorLinked = new Set((priorMap ?? []).map((r) => r.athlete_id))
+    const newlyLinked = matched.filter((m) => !priorLinked.has(m.athleteId)).length
+
     for (const m of matched) {
       await supabase
         .from('vald_profile_map')
@@ -444,7 +453,10 @@ async function syncAccount(account: ValdAccount, logId: number, orgId: string | 
       .eq('vald_account_id', account.id)
       .eq('resource', stateResource)
       .maybeSingle()
-    const since = state?.last_modified_utc ?? '2020-01-01T00:00:00.000Z'
+    // Re-read from the start when anyone was newly linked (see above). Every write is an idempotent
+    // upsert, so re-reading already-synced history is wasted time, never duplicated data. Progress
+    // is still saved as it runs, so a cut-off run resumes from wherever it got to.
+    const since = newlyLinked ? '2020-01-01T00:00:00.000Z' : (state?.last_modified_utc ?? '2020-01-01T00:00:00.000Z')
 
     const tests = await fetchTestsSince(token, account.region, account.tenant_id, since)
     const { data: mapRows } = await supabase
@@ -546,6 +558,7 @@ async function syncAccount(account: ValdAccount, logId: number, orgId: string | 
           : null,
         creation?.duplicateNames ? `${creation.duplicateNames} VALD profile(s) not added (duplicate full name — add manually)` : null,
         creation?.teamConflicts ? `${creation.teamConflicts} VALD profile(s) not added (in groups mapped to different teams — add manually)` : null,
+        newlyLinked ? `${newlyLinked} newly linked athlete(s) — history re-read from the start` : null,
         `${syncedTests} test(s) synced for ${inScopeAthleteIds.size} roster athlete(s) (${tests.length} scanned in VALD, ${orgId ? `org ${orgId} only` : 'ALL orgs on this account'}, from ${since.slice(0, 10)})`,
         fetchFailures ? `${fetchFailures} trial fetch failure(s) — re-sync to retry` : null,
         // Count only — never list names. These are real people on VALD who simply aren't on this
